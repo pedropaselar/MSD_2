@@ -1,202 +1,43 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, session, redirect, url_for
+from flask_sqlalchemy import SQLAlchemy
 from flask_migrate import Migrate
-from werkzeug.security import generate_password_hash, check_password_hash
+from authlib.integrations.flask_client import OAuth
 from config import Config
-from models import db, User
-import logging
-from flasgger import Swagger
 
 app = Flask(__name__)
 app.config.from_object(Config)
-db.init_app(app)
+db = SQLAlchemy(app)
 migrate = Migrate(app, db)
-swagger = Swagger(app)
+oauth = OAuth(app)
 
-# Configuração de logging
-logging.basicConfig(filename='error.log', level=logging.DEBUG)
+oauth.register(
+    name='keycloak',
+    client_id=app.config['OAUTH2_CLIENT_ID'],
+    client_secret=app.config['OAUTH2_CLIENT_SECRET'],
+    server_metadata_url=app.config['OAUTH2_DISCOVERY_URL'],
+    client_kwargs={'scope': 'openid profile email'}
+)
 
-@app.route('/', methods=['POST'])
-def create_user():
-    """
-    Criação de Usuário
-    ---
-    parameters:
-      - name: username
-        in: body
-        type: string
-        required: true
-        description: Nome do usuário
-      - name: password
-        in: body
-        type: string
-        required: true
-        description: Senha do usuário
-    responses:
-      201:
-        description: Usuário criado com sucesso
-      400:
-        description: Erro na criação do usuário
-    """
-    try:
-        data = request.get_json()
-        app.logger.debug(f"Data received: {data}")
-        username = data.get('username')
-        password = data.get('password')
+@app.route('/login')
+def login():
+    redirect_uri = url_for('authorize', _external=True)
+    return oauth.keycloak.authorize_redirect(redirect_uri)
 
-        # Validações adicionais
-        if not username or not password:
-            app.logger.error("Username or password not provided")
-            return jsonify({"message": "Username and password are required"}), 400
-        
-        if len(username) < 5:
-            app.logger.error("Username too short")
-            return jsonify({"message": "Username must be at least 5 characters long"}), 400
+@app.route('/authorize')
+def authorize():
+    token = oauth.keycloak.authorize_access_token()
+    user = oauth.keycloak.parse_id_token(token)
+    session['user'] = user
+    return redirect('/')
 
-        if len(password) < 8:
-            app.logger.error("Password too short")
-            return jsonify({"message": "Password must be at least 8 characters long"}), 400
-
-        if User.query.filter_by(username=username).first():
-            return jsonify({"message": "Username already exists"}), 400
-
-        hashed_password = generate_password_hash(password, method='pbkdf2:sha256')
-        new_user = User(username=username, password=hashed_password)
-        db.session.add(new_user)
+@app.route('/desbloquear/<username>', methods=['PUT'])
+def desbloquear_usuario(username):
+    user = User.query.filter_by(username=username).first()
+    if user and user.bloqueado:
+        user.bloqueado = False
         db.session.commit()
-        app.logger.info(f"User {username} created successfully")
-        return jsonify({"message": "User created successfully"}), 201
-    except Exception as e:
-        app.logger.error(f"Error creating user: {e}")
-        return jsonify({"message": "Internal server error"}), 500
-
-@app.route('/', methods=['PUT'])
-def login_user():
-    """
-    Login de Usuário
-    ---
-    parameters:
-      - name: username
-        in: body
-        type: string
-        required: true
-        description: Nome do usuário
-      - name: password
-        in: body
-        type: string
-        required: true
-        description: Senha do usuário
-    responses:
-      200:
-        description: Login realizado com sucesso
-      401:
-        description: Nome de usuário ou senha inválidos
-      403:
-        description: Usuário bloqueado ou precisa trocar a senha
-    """
-    try:
-        data = request.get_json()
-        username = data.get('username')
-        password = data.get('password')
-        user = User.query.filter_by(username=username).first()
-
-        if not user:
-            app.logger.warning(f"Failed login attempt for non-existent user: {username}")
-            return jsonify({"message": "Invalid username or password"}), 401
-        
-        if user.blocked:
-            app.logger.warning(f"Blocked user attempted login: {username}")
-            return jsonify({"message": "User is blocked"}), 403
-        
-        if not check_password_hash(user.password, password):
-            user.total_failures += 1
-            if user.total_failures > 5:
-                user.blocked = True
-            db.session.commit()
-            app.logger.warning(f"Failed login attempt for user: {username}")
-            return jsonify({"message": "Invalid username or password"}), 401
-        
-        user.total_logins += 1
-        if user.total_logins > 10:
-            app.logger.info(f"User {username} required to change password")
-            return jsonify({"message": "Password change required"}), 403
-        
-        db.session.commit()
-        app.logger.info(f"User {username} logged in successfully")
-        return jsonify({"message": "Login successful"}), 200
-    except Exception as e:
-        app.logger.error(f"Error logging in user: {e}")
-        return jsonify({"message": "Internal server error"}), 500
-
-@app.route('/trocasenha', methods=['PUT'])
-def change_password():
-    """
-    Troca de Senha
-    ---
-    parameters:
-      - name: username
-        in: body
-        type: string
-        required: true
-        description: Nome do usuário
-      - name: current_password
-        in: body
-        type: string
-        required: true
-        description: Senha atual do usuário
-      - name: new_password
-        in: body
-        type: string
-        required: true
-        description: Nova senha do usuário
-    responses:
-      200:
-        description: Senha trocada com sucesso
-      401:
-        description: Nome de usuário ou senha inválidos
-    """
-    try:
-        data = request.get_json()
-        username = data.get('username')
-        current_password = data.get('current_password')
-        new_password = data.get('new_password')
-        user = User.query.filter_by(username=username).first()
-        if not user or not check_password_hash(user.password, current_password):
-            return jsonify({"message": "Invalid username or password"}), 401
-        user.password = generate_password_hash(new_password, method='pbkdf2:sha256')
-        user.total_logins = 0
-        db.session.commit()
-        return jsonify({"message": "Password changed successfully"}), 200
-    except Exception as e:
-        app.logger.error(f"Error changing password: {e}")
-        return jsonify({"message": "Internal server error"}), 500
-
-@app.route('/bloqueados', methods=['GET'])
-def get_blocked_users():
-    """
-    Listar Usuários Bloqueados
-    ---
-    responses:
-      200:
-        description: Lista de usuários bloqueados
-        schema:
-          type: array
-          items:
-            properties:
-              username:
-                type: string
-              total_failures:
-                type: integer
-    """
-    try:
-        blocked_users = User.query.filter_by(blocked=True).all()
-        result = []
-        for user in blocked_users:
-            user_data = {'username': user.username, 'total_failures': user.total_failures}
-            result.append(user_data)
-        return jsonify(result), 200
-    except Exception as e:
-        app.logger.error(f"Error fetching blocked users: {e}")
-        return jsonify({"message": "Internal server error"}), 500
+        return jsonify({"message": "Usuário desbloqueado com sucesso!"}), 200
+    return jsonify({"message": "Usuário não encontrado ou não bloqueado."}), 404
 
 if __name__ == '__main__':
-    app.run(debug=True)
+    app.run()
